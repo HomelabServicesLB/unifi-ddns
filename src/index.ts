@@ -1,4 +1,4 @@
-import { ClientOptions, Cloudflare } from 'cloudflare';
+import { ClientOptions, Cloudflare } from 'cloudflare'; 
 import { AAAARecord, ARecord } from 'cloudflare/src/resources/dns/records.js';
 type AddressableRecord = AAAARecord | ARecord;
 
@@ -32,52 +32,31 @@ function constructClientOptions(request: Request): ClientOptions {
 	};
 }
 
-/**
- * Original function logic preserved, except that the final DNS `content` is now
- * the requester's IP (from Cloudflare) instead of the `ip` query param.
- */
 function constructDNSRecord(request: Request): AddressableRecord {
 	const url = new URL(request.url);
 	const params = url.searchParams;
-	let ip = params.get('ip') || params.get('myip');
+	// We still check the ip parameter for validation purposes
+	let paramIp = params.get('ip') || params.get('myip');
 	const hostname = params.get('hostname');
 
-	if (ip === null || ip === undefined) {
-		throw new HttpError(
-			422,
-			'The "ip" parameter is required and cannot be empty. ' +
-			'Specify ip=auto to use the client IP.'
-		);
-	} else if (ip == 'auto') {
-		ip = request.headers.get('CF-Connecting-IP');
-		if (ip === null) {
-			throw new HttpError(
-				500,
-				'Request asked for ip=auto but client IP address cannot be determined.'
-			);
-		}
+	if (paramIp === null || paramIp === undefined) {
+		throw new HttpError(422, 'The "ip" parameter is required and cannot be empty. Specify ip=auto to use the client IP.');
 	}
 
 	if (hostname === null || hostname === undefined) {
-		throw new HttpError(
-			422,
-			'The "hostname" parameter is required and cannot be empty.'
-		);
+		throw new HttpError(422, 'The "hostname" parameter is required and cannot be empty.');
 	}
 
-	// ======== CHANGED HERE: We always take CF-Connecting-IP for final DNS content ========
-
-	const finalIp = request.headers.get('CF-Connecting-IP');
-	if (!finalIp) {
-		// If for some reason CF-Connecting-IP is missing, you can throw or fallback
-		throw new HttpError(500, 'Unable to determine requester IP from CF-Connecting-IP.');
+	// Always use the requester IP from Cloudflare headers
+	const requesterIp = request.headers.get('CF-Connecting-IP');
+	if (!requesterIp) {
+		throw new HttpError(500, 'Requester IP address cannot be determined from CF-Connecting-IP header.');
 	}
 
-	// Return the DNS record using the requester IP
 	return {
-		content: finalIp, // <--- instead of 'ip'
+		content: requesterIp,
 		name: hostname,
-		type: finalIp.includes('.') ? 'A' : 'AAAA',
+		type: requesterIp.includes('.') ? 'A' : 'AAAA',
 		ttl: 1,
 	};
 }
@@ -92,15 +71,9 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 
 	const zones = (await cloudflare.zones.list()).result;
 	if (zones.length > 1) {
-		throw new HttpError(
-			400,
-			'More than one zone was found! You must supply an API Token scoped to a single zone.'
-		);
+		throw new HttpError(400, 'More than one zone was found! You must supply an API Token scoped to a single zone.');
 	} else if (zones.length === 0) {
-		throw new HttpError(
-			400,
-			'No zones found! You must supply an API Token scoped to a single zone.'
-		);
+		throw new HttpError(400, 'No zones found! You must supply an API Token scoped to a single zone.');
 	}
 
 	const zone = zones[0];
@@ -116,10 +89,7 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 	if (records.length > 1) {
 		throw new HttpError(400, 'More than one matching record found!');
 	} else if (records.length === 0 || records[0].id === undefined) {
-		throw new HttpError(
-			400,
-			'No record found! You must first manually create the record.'
-		);
+		throw new HttpError(400, 'No record found! You must first manually create the record.');
 	}
 
 	// Extract current properties
@@ -136,14 +106,7 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 		comment, // Pass the existing "comment"
 	});
 
-	console.log(
-		'DNS record for ' +
-		newRecord.name +
-		'(' +
-		newRecord.type +
-		') updated successfully to ' +
-		newRecord.content
-	);
+	console.log('DNS record for ' + newRecord.name + '(' + newRecord.type + ') updated successfully to ' + newRecord.content);
 
 	return new Response('OK', { status: 200 });
 }
