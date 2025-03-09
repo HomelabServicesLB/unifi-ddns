@@ -16,7 +16,7 @@ UniFi devices do not natively support Cloudflare as a DDNS provider. This script
 ### 1. **Deploy the Cloudflare Worker**
 
 #### **Option 1: Click to Deploy**
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/willswire/unifi-ddns)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/HomelabServicesLB//unifi-ddns)
 
 1. Click the button above.
 2. Complete the deployment.
