@@ -3,159 +3,172 @@ import { AAAARecord, ARecord } from 'cloudflare/src/resources/dns/records.js';
 type AddressableRecord = AAAARecord | ARecord;
 
 class HttpError extends Error {
-  constructor(public statusCode: number, message: string) {
-    super(message);
-    this.name = 'HttpError';
-  }
+	constructor(
+		public statusCode: number,
+		message: string,
+	) {
+		super(message);
+		this.name = 'HttpError';
+	}
 }
 
 function constructClientOptions(request: Request): ClientOptions {
-  const authorization = request.headers.get('Authorization');
-  if (!authorization) {
-    throw new HttpError(401, 'API token missing.');
-  }
+	const authorization = request.headers.get('Authorization');
+	if (!authorization) {
+		throw new HttpError(401, 'API token missing.');
+	}
 
-  // The Authorization header is expected to be "Basic base64Encoded(user:token)"
-  const [, data] = authorization.split(' ');
-  const decoded = atob(data);
-  const index = decoded.indexOf(':');
+	const [, data] = authorization.split(' ');
+	const decoded = atob(data);
+	const index = decoded.indexOf(':');
 
-  if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
-    throw new HttpError(401, 'Invalid API key or token format in Authorization header.');
-  }
+	if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
+		throw new HttpError(401, 'Invalid API key or token.');
+	}
 
-  return {
-    apiEmail: decoded.substring(0, index),
-    apiToken: decoded.substring(index + 1),
-  };
+	return {
+		apiEmail: decoded.substring(0, index),
+		apiToken: decoded.substring(index + 1),
+	};
 }
 
 /**
- * Always uses Cloudflare's IP (request.cf?.connectingIp) for the DNS record update,
- * but will still log the device's IP if provided in the query parameter (?ip=).
+ * Original function logic preserved, except that the final DNS `content` is now
+ * the requester's IP (from Cloudflare) instead of the `ip` query param.
  */
 function constructDNSRecord(request: Request): AddressableRecord {
-  const url = new URL(request.url);
+	const url = new URL(request.url);
+	const params = url.searchParams;
+	let ip = params.get('ip') || params.get('myip');
+	const hostname = params.get('hostname');
 
-  // The device IP param that the UDM might send, e.g. ?ip=%i
-  const deviceIpParam = url.searchParams.get('ip');
-  // The mandatory hostname, e.g. ?hostname=%h
-  const hostname = url.searchParams.get('hostname');
+	if (ip === null || ip === undefined) {
+		throw new HttpError(
+			422,
+			'The "ip" parameter is required and cannot be empty. ' +
+			'Specify ip=auto to use the client IP.'
+		);
+	} else if (ip == 'auto') {
+		ip = request.headers.get('CF-Connecting-IP');
+		if (ip === null) {
+			throw new HttpError(
+				500,
+				'Request asked for ip=auto but client IP address cannot be determined.'
+			);
+		}
+	}
 
-  // Enforce the presence of the hostname
-  if (!hostname) {
-    throw new HttpError(422, 'The "hostname" parameter is required and cannot be empty.');
-  }
+	if (hostname === null || hostname === undefined) {
+		throw new HttpError(
+			422,
+			'The "hostname" parameter is required and cannot be empty.'
+		);
+	}
 
-  // Always use the requester's IP from Cloudflare for the DNS record
-  const finalIp = request.cf?.connectingIp || request.headers.get('CF-Connecting-IP');
-  if (!finalIp) {
-    throw new HttpError(500, 'Unable to determine the client IP address from Cloudflare.');
-  }
+	// ======== CHANGED HERE: We always take CF-Connecting-IP for final DNS content ========
 
-  // Log or do anything you want with the device IP param, but do not use it in the DNS update
-  console.log(`Ignoring device-supplied IP param: ${deviceIpParam}`);
-  console.log(`Using CF-Connecting-IP instead: ${finalIp}`);
+	const finalIp = request.headers.get('CF-Connecting-IP');
+	if (!finalIp) {
+		// If for some reason CF-Connecting-IP is missing, you can throw or fallback
+		throw new HttpError(500, 'Unable to determine requester IP from CF-Connecting-IP.');
+	}
 
-  return {
-    content: finalIp,
-    name: hostname,
-    type: finalIp.includes('.') ? 'A' : 'AAAA',
-    ttl: 1,
-  };
+	// Return the DNS record using the requester IP
+	return {
+		content: finalIp, // <--- instead of 'ip'
+		name: hostname,
+		type: finalIp.includes('.') ? 'A' : 'AAAA',
+		ttl: 1,
+	};
 }
 
 async function update(clientOptions: ClientOptions, newRecord: AddressableRecord): Promise<Response> {
-  const cloudflare = new Cloudflare(clientOptions);
+	const cloudflare = new Cloudflare(clientOptions);
 
-  // Verify token status
-  const tokenStatus = (await cloudflare.user.tokens.verify()).status;
-  if (tokenStatus !== 'active') {
-    throw new HttpError(401, 'This API Token is ' + tokenStatus);
-  }
+	const tokenStatus = (await cloudflare.user.tokens.verify()).status;
+	if (tokenStatus !== 'active') {
+		throw new HttpError(401, 'This API Token is ' + tokenStatus);
+	}
 
-  // List zones
-  const zones = (await cloudflare.zones.list()).result;
-  if (zones.length > 1) {
-    throw new HttpError(
-      400,
-      'More than one zone found! The API Token must be scoped to a single zone.'
-    );
-  } else if (zones.length === 0) {
-    throw new HttpError(400, 'No zones found! The API Token must be scoped to at least one zone.');
-  }
+	const zones = (await cloudflare.zones.list()).result;
+	if (zones.length > 1) {
+		throw new HttpError(
+			400,
+			'More than one zone was found! You must supply an API Token scoped to a single zone.'
+		);
+	} else if (zones.length === 0) {
+		throw new HttpError(
+			400,
+			'No zones found! You must supply an API Token scoped to a single zone.'
+		);
+	}
 
-  const zone = zones[0];
+	const zone = zones[0];
 
-  // Find existing DNS record for the requested hostname (newRecord.name)
-  const records = (
-    await cloudflare.dns.records.list({
-      zone_id: zone.id,
-      name: newRecord.name as any,
-      type: newRecord.type,
-    })
-  ).result;
+	const records = (
+		await cloudflare.dns.records.list({
+			zone_id: zone.id,
+			name: newRecord.name as any,
+			type: newRecord.type,
+		})
+	).result;
 
-  if (records.length > 1) {
-    throw new HttpError(400, 'More than one matching record found!');
-  } else if (records.length === 0 || !records[0].id) {
-    throw new HttpError(
-      400,
-      'No matching record found! You must manually create the record before updating.'
-    );
-  }
+	if (records.length > 1) {
+		throw new HttpError(400, 'More than one matching record found!');
+	} else if (records.length === 0 || records[0].id === undefined) {
+		throw new HttpError(
+			400,
+			'No record found! You must first manually create the record.'
+		);
+	}
 
-  // Preserve current "proxied" and "comment" properties
-  const currentRecord = records[0] as AddressableRecord;
-  const proxied = currentRecord.proxied ?? false;
-  const comment = currentRecord.comment;
+	// Extract current properties
+	const currentRecord = records[0] as AddressableRecord;
+	const proxied = currentRecord.proxied ?? false; // Default to false if proxied is undefined
+	const comment = currentRecord.comment;
 
-  // Update DNS record
-  await cloudflare.dns.records.update(records[0].id, {
-    content: newRecord.content,
-    zone_id: zone.id,
-    name: newRecord.name as any,
-    type: newRecord.type,
-    proxied,
-    comment,
-  });
+	await cloudflare.dns.records.update(records[0].id, {
+		content: newRecord.content,
+		zone_id: zone.id,
+		name: newRecord.name as any,
+		type: newRecord.type,
+		proxied, // Pass the existing "proxied" status
+		comment, // Pass the existing "comment"
+	});
 
-  console.log(
-    `DNS record for ${newRecord.name} (${newRecord.type}) updated successfully to ${newRecord.content}`
-  );
+	console.log(
+		'DNS record for ' +
+		newRecord.name +
+		'(' +
+		newRecord.type +
+		') updated successfully to ' +
+		newRecord.content
+	);
 
-  return new Response('OK', { status: 200 });
+	return new Response('OK', { status: 200 });
 }
 
 export default {
-  async fetch(request: Request): Promise<Response> {
-    // Basic logging for debugging
-    console.log('Requester IP:', request.headers.get('CF-Connecting-IP'));
-    console.log(`${request.method}: ${request.url}`);
+	async fetch(request): Promise<Response> {
+		console.log('Requester IP: ' + request.headers.get('CF-Connecting-IP'));
+		console.log(request.method + ': ' + request.url);
+		console.log('Body: ' + (await request.text()));
 
-    // If you want to see the request body for debugging
-    const bodyText = await request.text();
-    if (bodyText) {
-      console.log('Request Body:', bodyText);
-    }
+		try {
+			// Construct client options and DNS record
+			const clientOptions = constructClientOptions(request);
+			const record = constructDNSRecord(request);
 
-    try {
-      // 1. Parse your Cloudflare client options (API token, etc.)
-      const clientOptions = constructClientOptions(request);
-
-      // 2. Create the DNS record object, ignoring the device IP param
-      const record = constructDNSRecord(request);
-
-      // 3. Update the DNS record in Cloudflare
-      return await update(clientOptions, record);
-    } catch (error) {
-      if (error instanceof HttpError) {
-        console.log('Error updating DNS record:', error.message);
-        return new Response(error.message, { status: error.statusCode });
-      } else {
-        console.log('Unexpected error:', error);
-        return new Response('Internal Server Error', { status: 500 });
-      }
-    }
-  },
+			// Run the update function
+			return await update(clientOptions, record);
+		} catch (error) {
+			if (error instanceof HttpError) {
+				console.log('Error updating DNS record: ' + error.message);
+				return new Response(error.message, { status: error.statusCode });
+			} else {
+				console.log('Error updating DNS record: ' + error);
+				return new Response('Internal Server Error', { status: 500 });
+			}
+		}
+	},
 } satisfies ExportedHandler<Env>;
